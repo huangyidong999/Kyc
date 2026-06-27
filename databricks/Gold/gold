@@ -1,0 +1,81 @@
+from pyspark.sql.functions import col, lit, trim, upper, when
+from pyspark.sql.utils import AnalysisException
+
+# Configuration
+catalog_name = "kyc_catalog"
+gold_schema_name = "gold"
+source_table = f"{catalog_name}.bronze.silver_kyc_customer_profile"
+target_table = f"{catalog_name}.{gold_schema_name}.gold_kyc_customer_profile"
+
+
+def ensure_schema(schema_name: str) -> None:
+    spark.sql(f"CREATE SCHEMA IF NOT EXISTS {catalog_name}.{schema_name}")
+
+
+def ensure_kyc_column(df):
+    if "KYC" not in df.columns:
+        return df.withColumn("KYC", lit(None).cast("string"))
+    return df
+
+
+try:
+    ensure_schema(gold_schema_name)
+
+    silver_df = spark.table(source_table)
+    silver_df = ensure_kyc_column(silver_df)
+
+    # Apply KYC risk classification rules
+    # Priority: preserve existing High Risk values first, then apply business rules
+    risk_classified_df = (
+        silver_df
+        .withColumn(
+            "KYC",
+            when(trim(upper(col("KYC"))) == "HIGH RISK", col("KYC"))
+            .when(trim(upper(col("source_system"))).isin("TB_BANK", "TD_BANK"), lit("High Risk"))
+            .when(trim(upper(col("risk_flag"))) == "Y", lit("Low Risk"))
+            .when(trim(upper(col("user_jurisdiction"))) == "GB-LDN", lit("Med Risk"))
+            .otherwise(col("KYC"))
+        )
+    )
+
+    # Write to Gold table
+    (
+        risk_classified_df.write
+        .format("delta")
+        .mode("overwrite")
+        .option("overwriteSchema", "true")
+        .saveAsTable(target_table)
+    )
+
+    gold_df = spark.table(target_table)
+    total_rows = gold_df.count()
+    print(f"Gold table written successfully: {target_table}")
+    print(f"Total rows in gold table: {total_rows}")
+
+    display(gold_df)
+
+    high_risk_df = (
+        gold_df
+        .filter(trim(upper(col("KYC"))) == "HIGH RISK")
+        .select(
+            "user_id",
+            "source_system",
+            "user_jurisdiction",
+            "risk_flag",
+            "pep_flag",
+            "user_country",
+            "user_address",
+            "user_job",
+            "user_account_channel",
+            "user_last_review_time",
+            "KYC"
+        )
+        .orderBy("user_id")
+    )
+
+    high_risk_count = high_risk_df.count()
+    print(f"High Risk users count: {high_risk_count}")
+    display(high_risk_df)
+
+except AnalysisException as e:
+    raise RuntimeError(f"Job failed while processing KYC gold layer: {str(e)}") from e

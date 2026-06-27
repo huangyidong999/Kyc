@@ -1,4 +1,5 @@
-from pyspark.sql.functions import col, from_json, when, trim, upper
+from pyspark.sql.functions import col, from_json, when, trim, upper, row_number
+from pyspark.sql.window import Window
 from pyspark.sql.types import (
     StructType,
     StructField,
@@ -37,13 +38,10 @@ event_schema = StructType([
     StructField("payload", payload_schema, True)
 ])
 
-bronze_stream_df = (
-    spark.readStream
-        .table("kyc_catalog.bronze.bronze_kyc_customer_profile_raw")
-)
+bronze_df = spark.table("kyc_catalog.bronze.bronze_kyc_customer_profile_raw")
 
 parsed_df = (
-    bronze_stream_df
+    bronze_df
         .withColumn("json_data", from_json(col("raw_value"), event_schema))
         .select(
             col("kafka_key"),
@@ -74,21 +72,20 @@ silver_df = parsed_df.withColumn(
     .otherwise(col("pep_flag"))
 )
 
-if "pep_role" not in spark.table("kyc_catalog.bronze.silver_kyc_customer_profile").columns:
-    spark.sql(
-        "ALTER TABLE kyc_catalog.bronze.silver_kyc_customer_profile ADD COLUMNS (pep_role STRING)"
-    )
+user_window = Window.partitionBy("user_id").orderBy(col("event_time").desc(), col("ingestion_time").desc())
 
-query = (
-    silver_df.writeStream
-        .format("delta")
-        .outputMode("append")
-        .option("checkpointLocation", "/Volumes/kyc_catalog/bronze/checkpoints/silver_kyc_customer_profile_v2")
-        .trigger(availableNow=True)
-        .toTable("kyc_catalog.bronze.silver_kyc_customer_profile")
+silver_deduped = (
+    silver_df
+        .withColumn("row_num", row_number().over(user_window))
+        .filter(col("row_num") == 1)
+        .drop("row_num")
 )
 
-query.awaitTermination()
+silver_deduped.write \
+    .format("delta") \
+    .mode("overwrite") \
+    .option("overwriteSchema", "true") \
+    .saveAsTable("kyc_catalog.bronze.silver_kyc_customer_profile")
 
-
+# 查看覆盖后的 silver 表结果
 display(spark.table("kyc_catalog.bronze.silver_kyc_customer_profile"))
