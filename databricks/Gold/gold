@@ -1,62 +1,104 @@
-from pyspark.sql.functions import col, lit, trim, upper, when
+from pyspark.sql.functions import (
+    col,
+    concat_ws,
+    lit,
+    trim,
+    upper,
+    when,
+)
 from pyspark.sql.utils import AnalysisException
 
-# Configuration
 catalog_name = "kyc_catalog"
 gold_schema_name = "gold"
-source_table = f"{catalog_name}.bronze.silver_kyc_customer_profile"
-target_table = f"{catalog_name}.{gold_schema_name}.gold_kyc_customer_profile"
+silver_table = f"{catalog_name}.silver.silver_kyc_customer_profile"
+target_table = f"{catalog_name}.{gold_schema_name}.gold_kyc_customer_risk_score"
 
 
 def ensure_schema(schema_name: str) -> None:
     spark.sql(f"CREATE SCHEMA IF NOT EXISTS {catalog_name}.{schema_name}")
 
 
-def ensure_kyc_column(df):
-    if "KYC" not in df.columns:
-        return df.withColumn("KYC", lit(None).cast("string"))
-    return df
-
-
 try:
     ensure_schema(gold_schema_name)
 
-    silver_df = spark.table(source_table)
-    silver_df = ensure_kyc_column(silver_df)
+    silver_df = spark.table(silver_table)
+    high_risk_countries = [
+        "IRAN",
+        "RUSSIA",
+        "CHINA",
+        "SYRIA",
+        "SUDAN",
+        "CUBA",
+        "NORTH KOREA",
+        "MYANMAR",
+        "YEMEN",
+    ]
 
-    # Apply KYC risk classification rules
-    # Priority: preserve existing High Risk values first, then apply business rules
-    risk_classified_df = (
-        silver_df
-        .withColumn(
-            "KYC",
-            when(trim(upper(col("KYC"))) == "HIGH RISK", col("KYC"))
-            .when(trim(upper(col("source_system"))).isin("TB_BANK", "TD_BANK"), lit("High Risk"))
-            .when(trim(upper(col("risk_flag"))) == "Y", lit("Low Risk"))
-            .when(trim(upper(col("user_jurisdiction"))) == "GB-LDN", lit("Med Risk"))
-            .otherwise(col("KYC"))
+    risk_score = (
+        lit(0)
+        + when(trim(upper(col("risk_flag"))) == "Y", lit(40)).otherwise(lit(0))
+        + when(trim(upper(col("pep_flag"))) == "Y", lit(30)).otherwise(lit(0))
+        + when(upper(trim(col("user_country"))).isin(high_risk_countries), lit(25)).otherwise(lit(0))
+        + when(trim(upper(col("user_account_channel"))) == "ONLINE", lit(10)).otherwise(lit(0))
+        + when(col("is_last_review_over_365_days") == True, lit(15)).otherwise(lit(0))
+        + when(col("is_business_account") == True, lit(10)).otherwise(lit(0))
+    )
+
+    risk_level = (
+        when(risk_score >= 70, "HIGH")
+        .when(risk_score >= 30, "MEDIUM")
+        .otherwise("LOW")
+    )
+
+    risk_reasons = concat_ws(
+        ", ",
+        when(trim(upper(col("risk_flag"))) == "Y", lit("Third-party high-risk flag")).otherwise(lit(None)),
+        when(trim(upper(col("pep_flag"))) == "Y", lit("PEP customer")).otherwise(lit(None)),
+        when(upper(trim(col("user_country"))).isin(high_risk_countries), lit("High-risk country")).otherwise(lit(None)),
+        when(trim(upper(col("user_account_channel"))) == "ONLINE", lit("Online account opening")).otherwise(lit(None)),
+        when(col("is_last_review_over_365_days") == True, lit("Last review older than 365 days")).otherwise(lit(None)),
+        when(col("is_business_account") == True, lit("Business account")).otherwise(lit(None)),
+    )
+
+    gold_df = (
+        silver_df.withColumn("risk_score", risk_score.cast("int"))
+        .withColumn("risk_level", risk_level)
+        .withColumn("risk_reasons", risk_reasons)
+        .select(
+            "user_id",
+            "event_id",
+            "event_time",
+            "source_system",
+            "user_jurisdiction",
+            "risk_flag",
+            "pep_flag",
+            "user_country",
+            "user_account_channel",
+            "user_account_types",
+            "user_last_review_time",
+            "risk_score",
+            "risk_level",
+            "risk_reasons",
+            "pep_role",
         )
     )
 
-    # Write to Gold table
     (
-        risk_classified_df.write
-        .format("delta")
+        gold_df.write.format("delta")
         .mode("overwrite")
         .option("overwriteSchema", "true")
         .saveAsTable(target_table)
     )
 
-    gold_df = spark.table(target_table)
-    total_rows = gold_df.count()
+    gold_output_df = spark.table(target_table)
+    total_rows = gold_output_df.count()
     print(f"Gold table written successfully: {target_table}")
     print(f"Total rows in gold table: {total_rows}")
 
-    display(gold_df)
+    display(gold_output_df)
 
     high_risk_df = (
-        gold_df
-        .filter(trim(upper(col("KYC"))) == "HIGH RISK")
+        gold_output_df.filter(trim(upper(col("risk_level"))) == "HIGH")
         .select(
             "user_id",
             "source_system",
@@ -64,11 +106,12 @@ try:
             "risk_flag",
             "pep_flag",
             "user_country",
-            "user_address",
-            "user_job",
             "user_account_channel",
+            "user_account_types",
             "user_last_review_time",
-            "KYC"
+            "risk_score",
+            "risk_level",
+            "risk_reasons",
         )
         .orderBy("user_id")
     )
